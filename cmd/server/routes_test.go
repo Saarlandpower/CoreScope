@@ -2843,16 +2843,14 @@ func TestConfigGeoFilterEndpoint(t *testing.T) {
 		if body["bufferKm"] == nil {
 			t.Error("expected bufferKm in response")
 		}
-		if _, ok := body["writeEnabled"]; !ok {
-			t.Error("expected writeEnabled field in response")
-		}
-		// No apiKey configured → writeEnabled should be false
-		if body["writeEnabled"] != false {
-			t.Errorf("expected writeEnabled=false when no apiKey, got %v", body["writeEnabled"])
+		// writeEnabled must NOT be leaked: the public GET endpoint should not
+		// disclose whether a strong apiKey is configured to unauthenticated callers.
+		if _, ok := body["writeEnabled"]; ok {
+			t.Errorf("writeEnabled must not be present in public GET response (info disclosure), got %v", body["writeEnabled"])
 		}
 	})
 
-	t.Run("writeEnabled true when strong apiKey configured", func(t *testing.T) {
+	t.Run("writeEnabled is not exposed even when strong apiKey configured", func(t *testing.T) {
 		db := setupTestDB(t)
 		cfg := &Config{Port: 3000, APIKey: "a-strong-api-key-1234"}
 		hub := NewHub()
@@ -2868,8 +2866,8 @@ func TestConfigGeoFilterEndpoint(t *testing.T) {
 
 		var body map[string]interface{}
 		json.Unmarshal(w.Body.Bytes(), &body)
-		if body["writeEnabled"] != true {
-			t.Errorf("expected writeEnabled=true when strong apiKey configured, got %v", body["writeEnabled"])
+		if _, ok := body["writeEnabled"]; ok {
+			t.Errorf("writeEnabled must not be present (would leak apiKey presence), got %v", body["writeEnabled"])
 		}
 	})
 }
