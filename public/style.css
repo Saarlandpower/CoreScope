@@ -1701,7 +1701,6 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
    above so its tighter padding/gap rules win the cascade by source
    order at 1024px (same specificity). */
 @media (min-width: 768px) and (max-width: 1100px) {
-  .nav-stats { display: none; }
   .nav-links { gap: 0; }
   .nav-link { padding: 14px 6px; }
   .nav-link.active { padding: 10px 6px; }
