@@ -728,13 +728,8 @@
       if (missedEl) missedEl.classList.add('hidden');
     }
     if (speedBtn) {
-      if (VCR.mode === 'LIVE') {
-        speedBtn.classList.add('hidden'); // #1346: animation is 1× in LIVE; speed control only meaningful in REPLAY
-      } else {
-        speedBtn.classList.remove('hidden');
-        speedBtn.textContent = speedLabel(VCR.speed);
-        speedBtn.setAttribute('aria-label', 'Speed ' + speedLabel(VCR.speed));
-      }
+      speedBtn.textContent = speedLabel(VCR.speed);
+      speedBtn.setAttribute('aria-label', 'Speed ' + speedLabel(VCR.speed));
     }
     updateVCRLcd();
   }
@@ -3239,7 +3234,7 @@
 
     const matrixGreen = '#00ff41';
     const TRAIL_LEN = Math.min(6, bytes.length);
-    const DURATION_MS = 1100 / ((VCR.mode === 'REPLAY') ? VCR.speed : 1); // #1346: animation honors VCR.speed in REPLAY (#922 slow-mo); LIVE always 1×
+    const DURATION_MS = 1100 / VCR.speed; // #922: animation honors VCR.speed
     const CHAR_INTERVAL = 0.06; // spawn a char every 6% of progress
     const charMarkers = [];
     let nextCharAt = CHAR_INTERVAL;
@@ -3371,7 +3366,7 @@
         return;
       }
       const elapsed = now - lastStep;
-      const stepMs = 33 / ((VCR.mode === 'REPLAY') ? VCR.speed : 1); // #1346: animation honors VCR.speed in REPLAY (#922 slow-mo); LIVE always 1×
+      const stepMs = 33 / VCR.speed; // #922: animation honors VCR.speed
       if (elapsed >= stepMs) {
         const ticks = Math.min(Math.floor(elapsed / stepMs), 4);
         lastStep = now;
