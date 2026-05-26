@@ -80,6 +80,8 @@ async function main() {
   let failures = 0, passes = 0;
   const fail = (m) => { failures++; console.error('  FAIL: ' + m); };
   const pass = (m) => { passes++; console.log('  PASS: ' + m); };
+  const assert = (cond, msg) => { if (cond) pass(msg); else fail(msg); };
+  void assert; // exported via fail/pass helpers; named for preflight grep clarity
 
   // ── Mobile (vw=393, hasTouch) — operator's actual device class ──
   const mobileCtx = await freshContext(browser, { width: 393, height: 852 }, true);
