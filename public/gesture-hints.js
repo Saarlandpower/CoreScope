@@ -8,9 +8,21 @@
  * - aria-live=polite, role=status, no focus stealing, pointer-events:none.
  * - prefers-reduced-motion: animation-name: none (style.css handles via media query).
  * - Singleton + cleanup: module-scoped guard; SPA re-mount must not re-show dismissed.
- * - Pull-to-refresh hint only when .pull-to-reconnect element exists in DOM.
- * - Edge-drawer hint only at viewport > 768px (where edge-swipe drawer applies).
- * - Row-swipe hint only on table pages: /#/packets, /#/nodes, etc.
+ * - #1402 fixes:
+ *     - Bug 1: tab-swipe race with bottom-nav init — schedule on initial load
+ *       AND on 'load' event (later than DOMContentLoaded) so [data-bottom-nav]
+ *       has been built by bottom-nav.js. Also schedule on any hashchange.
+ *     - Bug 2: edge-drawer is a MOBILE feature (per #1064/#1184). Condition
+ *       flipped from innerWidth > 768 to innerWidth < 768.
+ *     - Bug 3: pull-refresh no longer gated on `.pull-to-reconnect` (which
+ *       only renders on WS-disconnect per #1068). Use touch-viewport probe.
+ *     - Bug 4: row-swipe route filter widened to cover other tables with
+ *       swipable rows (channels, observers — verified to render tr/data rows).
+ *     - Bug 5 (confirmed via operator console trace): the schedule path was
+ *       only re-firing on hashchange because the initial `init()` race with
+ *       bottom-nav.js left the relevance checks failing — the 800ms timer
+ *       fired before [data-bottom-nav] was injected. Now a second schedule
+ *       runs on window 'load' (after all assets settle) as a safety net.
  */
 (function () {
   'use strict';
@@ -38,7 +50,11 @@
       relevant: function () {
         if (onLiveRoute()) return false; // #1244
         var h = location.hash || '';
-        return /^#\/(packets|nodes)/.test(h);
+        // #1402 Bug 4: widen to other tables with swipable rows.
+        // channels (.ch-item / .ch-row data-hash), observers (#obsTable tr) —
+        // verified via grep before adding. /perf and /analytics omitted: no
+        // swipable rows confirmed there.
+        return /^#\/(packets|nodes|channels|observers)/.test(h);
       },
       position: 'bottom',
     },
@@ -56,7 +72,10 @@
       text: 'Tip: swipe in from the left edge to open navigation.',
       relevant: function () {
         if (onLiveRoute()) return false; // #1244
-        return window.innerWidth > 768 && !!document.querySelector('.nav-drawer, [data-nav-drawer]');
+        // #1402 Bug 2: edge-swipe drawer (#1064/#1184) is a MOBILE feature.
+        // Original condition (> 768) was inverted — hint only fired on desktop
+        // where the drawer doesn't apply.
+        return window.innerWidth < 768 && !!document.querySelector('.nav-drawer, [data-nav-drawer]');
       },
       position: 'top-left',
     },
@@ -65,7 +84,11 @@
       text: 'Tip: pull down to refresh the connection.',
       relevant: function () {
         if (onLiveRoute()) return false; // #1244
-        return !!document.querySelector('.pull-to-reconnect');
+        // #1402 Bug 3: was gated on `.pull-to-reconnect` which only renders
+        // on WS-disconnect (#1068). First-visit healthy-connection operators
+        // never saw the hint. Decoupled: any touch viewport gets the hint.
+        var mm = window.matchMedia && window.matchMedia('(pointer: coarse)');
+        return !!(mm && mm.matches);
       },
       position: 'top',
     },
@@ -192,6 +215,16 @@
     if (!_routeChangeBound) {
       _routeChangeBound = true;
       window.addEventListener('hashchange', onRouteChange);
+      // #1402 Bug 5: schedule path was only firing reliably on hashchange.
+      // The initial scheduleHints() call below races bottom-nav.js (which
+      // injects [data-bottom-nav] from its own DOMContentLoaded init), so
+      // the 800ms tab-swipe relevance check returned false on first visit.
+      // Re-schedule on 'load' (after all sync init has completed) as a
+      // safety net. scheduleHints() is idempotent (clears prior timer),
+      // so this is a no-op when the first schedule already rendered.
+      if (document.readyState !== 'complete') {
+        window.addEventListener('load', scheduleHints, { once: true });
+      }
     }
     scheduleHints();
   }
