@@ -208,8 +208,11 @@ async function main() {
 
   await ctx.close();
 
-  // ── (e) at 1024x800, edge-swipe hint visible on first visit ──
-  const ctx2 = await browser.newContext({ viewport: { width: 1024, height: 800 } });
+  // ── (e) edge-drawer hint visible on first visit at narrow viewport ──
+  // #1402 Bug 2: edge-swipe drawer (#1064/#1184) is a MOBILE feature; original
+  // code/test had the condition inverted (innerWidth > 768). Corrected: assert
+  // edge-drawer at vw=393 (mobile), NOT at desktop.
+  const ctx2 = await browser.newContext({ viewport: { width: 393, height: 800 }, hasTouch: true });
   const page2 = await ctx2.newPage();
   await page2.goto(`${BASE}/#/packets`, { waitUntil: 'domcontentloaded' });
   await page2.evaluate((keys) => Object.values(keys).forEach((k) => localStorage.removeItem(k)), KEYS);
@@ -217,9 +220,9 @@ async function main() {
   await page2.waitForTimeout(HINT_SETTLE_MS);
   const edgeHint = await hintVisible(page2, 'edge-drawer');
   if (edgeHint.present && edgeHint.visible) {
-    pass('(e) edge-drawer hint visible at 1024x800');
+    pass('(e) edge-drawer hint visible at 393x800 (mobile — corrected per #1402)');
   } else {
-    fail(`(e) edge-drawer hint NOT visible at 1024x800 — state=${JSON.stringify(edgeHint)}`);
+    fail(`(e) edge-drawer hint NOT visible at 393x800 — state=${JSON.stringify(edgeHint)}`);
   }
   await ctx2.close();
 
