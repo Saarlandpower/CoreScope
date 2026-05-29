@@ -318,6 +318,19 @@ func main() {
 	defer stopAnalyticsRecomp()
 	log.Printf("[analytics-recompute] background recompute enabled (default=%s)", cfg.AnalyticsDefaultRecomputeInterval())
 
+	// #1481 P0-1: background recomputer for the default-shape
+	// /api/analytics/neighbor-graph response (5 min cadence). Reads
+	// hit an atomic pointer; the rebuild path no longer runs on the
+	// request goroutine for the common filter shape.
+	stopNeighborGraphCache := make(chan struct{})
+	ngInterval := neighborGraphCacheInterval
+	if cfg.NeighborGraph != nil && cfg.NeighborGraph.CacheRecomputeIntervalSeconds > 0 {
+		ngInterval = time.Duration(cfg.NeighborGraph.CacheRecomputeIntervalSeconds) * time.Second
+	}
+	srv.startNeighborGraphRecomputer(ngInterval, stopNeighborGraphCache)
+	defer close(stopNeighborGraphCache)
+	log.Printf("[neighbor-graph-cache] background recompute enabled (interval=%s)", ngInterval)
+
 	// Steady-state repeater-enrichment recomputer (issue #1262).
 	// Prewarms the bulk caches feeding handleNodes so the very first
 	// /api/nodes?limit=2000 from live.js's SPA bootstrap hits a

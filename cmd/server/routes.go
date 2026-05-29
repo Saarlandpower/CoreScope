@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -62,6 +63,26 @@ type Server struct {
 
 	// Router reference for OpenAPI spec generation
 	router *mux.Router
+
+	// Cached default (no-filter) /api/observers response, served from an
+	// atomic-pointer snapshot. Refilled via singleflight on TTL boundary
+	// to prevent thundering-herd SQL stampedes. Issue #1481 P0-3 +
+	// #1483 follow-up (singleflight + monotonic time).
+	observersCacheV2 observersCacheField
+
+	// Cached default-shape /api/analytics/neighbor-graph response,
+	// recomputed every 5 min in a background goroutine. Issue #1481 P0-1.
+	neighborGraphCache neighborGraphCacheField
+
+	// Counter for rebuild-panic events on the neighbor-graph cache
+	// background recomputer. Surfaced via /api/stats. #1483 follow-up.
+	neighborGraphCacheRebuildFailures uint64
+
+	// Test injection: when non-nil, replaces the real
+	// computeNeighborGraphResponse pipeline so tests can assert the
+	// bypass branch was exercised without standing up a full DB/store.
+	// Production code MUST leave this nil. #1483 follow-up.
+	computeNeighborGraphResponseFn func(minCount int, minScore float64, region, role string) NeighborGraphResponse
 }
 
 // PerfStats tracks request performance.
@@ -708,6 +729,8 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		ProcessRSSMB:  mem.ProcessRSSMB,
 		GoHeapInuseMB: mem.GoHeapInuseMB,
 		GoSysMB:       mem.GoSysMB,
+
+		NeighborGraphCacheRebuildFailures: atomic.LoadUint64(&s.neighborGraphCacheRebuildFailures),
 	}
 
 	s.statsMu.Lock()
@@ -2321,10 +2344,62 @@ func (s *Server) handleChannelMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleObservers(w http.ResponseWriter, r *http.Request) {
-	observers, err := s.db.GetObservers()
+	// #1481 P0-3 + #1483: serve from 30s atomic-pointer cache for the
+	// default (no-filter) query shape. Refill is collapsed via
+	// singleflight so concurrent TTL-boundary requests do not stampede
+	// the 1.9M-row observations table.
+	isDefault := r.URL.RawQuery == ""
+	if isDefault {
+		if e, ok := s.loadObserversCache(); ok && !s.observersCacheExpired(e.at) {
+			w.Header().Set("X-Cache-Age-Seconds", cacheAgeSecondsHeader(time.Since(e.at)))
+			writeJSON(w, e.resp)
+			return
+		}
+	}
+
+	if isDefault {
+		v, err, _ := s.observersCacheV2.sf.Do(observersCacheFlightKey, func() (interface{}, error) {
+			// Double-check inside the singleflight: another winner
+			// may have just stored a fresh entry.
+			if e, ok := s.loadObserversCache(); ok && !s.observersCacheExpired(e.at) {
+				return e, nil
+			}
+			resp, herr := s.buildObserversDefaultResponse()
+			if herr != nil {
+				return nil, herr
+			}
+			s.observersCacheV2.fillCount.Add(1)
+			entry := &observersCacheEntry{resp: resp, at: time.Now()}
+			s.observersCacheV2.ptr.Store(entry)
+			return entry, nil
+		})
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		entry := v.(*observersCacheEntry)
+		w.Header().Set("X-Cache-Age-Seconds", cacheAgeSecondsHeader(time.Since(entry.at)))
+		writeJSON(w, entry.resp)
+		return
+	}
+
+	// Non-default queries bypass the cache entirely (filters not yet wired).
+	resp, err := s.buildObserversDefaultResponse()
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
+	}
+	writeJSON(w, resp)
+}
+
+// buildObserversDefaultResponse runs the underlying SQL pipeline for
+// the default-shape /api/observers payload. Extracted so the cache
+// refill path can be wrapped in singleflight and counted by tests.
+// #1483 follow-up.
+func (s *Server) buildObserversDefaultResponse() (ObserverListResponse, error) {
+	observers, err := s.db.GetObservers()
+	if err != nil {
+		return ObserverListResponse{}, err
 	}
 
 	// Batch lookup: packetsLastHour per observer
@@ -2372,10 +2447,10 @@ func (s *Server) handleObservers(w http.ResponseWriter, r *http.Request) {
 		applyObserverNaiveClock(&resp, o, nowTime)
 		result = append(result, resp)
 	}
-	writeJSON(w, ObserverListResponse{
+	return ObserverListResponse{
 		Observers:  result,
 		ServerTime: time.Now().UTC().Format(time.RFC3339),
-	})
+	}, nil
 }
 
 func (s *Server) handleObserverDetail(w http.ResponseWriter, r *http.Request) {
@@ -2435,19 +2510,15 @@ func (s *Server) handleObserverAnalytics(w http.ResponseWriter, r *http.Request)
 	since := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
 	s.store.mu.RLock()
 	obsList := s.store.byObserver[id]
-	filtered := make([]*StoreObs, 0, len(obsList))
-	for _, obs := range obsList {
-		if obs.Timestamp == "" {
-			continue
-		}
-		t, err := time.Parse(time.RFC3339Nano, obs.Timestamp)
-		if err != nil {
-			t, err = time.Parse(time.RFC3339, obs.Timestamp)
-		}
-		if err != nil {
-			t, err = time.Parse("2006-01-02 15:04:05", obs.Timestamp)
-		}
-		if err != nil {
+	// #1481 P0-2: snapshot pointer slice and release RLock immediately —
+	// don't iterate + json-decode + time-parse under the lock.
+	obsSnapshot := make([]*StoreObs, len(obsList))
+	copy(obsSnapshot, obsList)
+	s.store.mu.RUnlock()
+	filtered := make([]*StoreObs, 0, len(obsSnapshot))
+	for _, obs := range obsSnapshot {
+		t, ok := obs.ParsedTime()
+		if !ok {
 			continue
 		}
 		if t.Equal(since) || t.After(since) {
@@ -2479,14 +2550,8 @@ func (s *Server) handleObserverAnalytics(w http.ResponseWriter, r *http.Request)
 	recentPackets := make([]map[string]interface{}, 0, 20)
 
 	for i, obs := range filtered {
-		ts, err := time.Parse(time.RFC3339Nano, obs.Timestamp)
-		if err != nil {
-			ts, err = time.Parse(time.RFC3339, obs.Timestamp)
-		}
-		if err != nil {
-			ts, err = time.Parse("2006-01-02 15:04:05", obs.Timestamp)
-		}
-		if err != nil {
+		ts, ok := obs.ParsedTime()
+		if !ok {
 			continue
 		}
 		bucketStart := ts.UTC().Truncate(bucketDur).Unix()
@@ -2528,7 +2593,8 @@ func (s *Server) handleObserverAnalytics(w http.ResponseWriter, r *http.Request)
 			recentPackets = append(recentPackets, enriched)
 		}
 	}
-	s.store.mu.RUnlock()
+	// #1481 P0-2: RLock was released earlier after snapshotting the
+	// observation pointer slice; no Unlock needed here.
 
 	buildTimeline := func(counts map[int64]int) []TimeBucket {
 		keys := make([]int64, 0, len(counts))
