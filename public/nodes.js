@@ -689,6 +689,7 @@
 
         <div class="node-full-card" id="fullPathsSection">
           <h4>Paths Through This Node</h4>
+          <div class="path-symbols-legend-wrapper">${(window.HopDisplay && HopDisplay.renderPathSymbolsLegend) ? HopDisplay.renderPathSymbolsLegend() : ''}</div>
           <div id="fullPathsContent"><div class="text-muted" style="padding:8px"><span class="spinner"></span> Loading paths…</div></div>
         </div>
 
