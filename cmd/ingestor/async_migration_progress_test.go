@@ -136,9 +136,11 @@ func TestIsDuplicateColumnErr_DriverStringPinned(t *testing.T) {
 	s := newTestStore(t)
 	s.WaitForAsyncMigrations()
 	// First ALTER should succeed (or already-exist; either is fine).
+	// PREFLIGHT: async=true reason="test probe — single ALTER ADD COLUMN on the bookkeeping _async_migrations table in an in-memory test DB. Microseconds at any scale."
 	_, _ = s.db.Exec(`ALTER TABLE _async_migrations ADD COLUMN __dup_probe TEXT`)
 	// Second ALTER MUST produce the "duplicate column" error so we can
 	// pin the wording.
+	// PREFLIGHT: async=true reason="test probe — intentional duplicate ALTER on a test DB to provoke and pin the driver's duplicate-column error wording."
 	_, err := s.db.Exec(`ALTER TABLE _async_migrations ADD COLUMN __dup_probe TEXT`)
 	if err == nil {
 		t.Fatalf("second ALTER ADD COLUMN should have errored")
