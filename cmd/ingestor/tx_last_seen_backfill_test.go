@@ -172,9 +172,11 @@ func TestChunkedBackfill_CtxCancelMidLoop(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Cancel shortly after the first batch starts.
+	// Cancel after first batches have committed but before the loop
+	// is done. With batchSize=1000 and yieldDelay=80ms, expect several
+	// batches to complete before the 250ms cancel fires.
 	go func() {
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(250 * time.Millisecond)
 		cancel()
 	}()
 

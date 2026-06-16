@@ -158,27 +158,29 @@ func OpenStoreWithInterval(dbPath string, sampleIntervalSec int) (*Store, error)
 		}
 	}
 
-	// #1690: backfill transmissions.last_seen from MAX(observations.timestamp)
-	// per transmission. The column is added inline by dbschema.Apply (cheap
-	// metadata-only ALTER); the populate query is potentially expensive
-	// (full obs scan + group) so we run it async. Subsequent observation
-	// inserts maintain the column inline (see InsertTransmission below).
-	// PREFLIGHT: async=true reason="full-table backfill JOIN (1.9M+ obs × 86k+ tx in prod) — must not block ingestor boot"
+	// #1690 (#1724 cold-load fix): backfill transmissions.last_seen from
+	// MAX(observations.timestamp) per transmission. The column is added
+	// inline by dbschema.Apply (cheap metadata-only ALTER); the populate
+	// query was originally a single correlated UPDATE that pinned the
+	// single writer for 10-15 min on operator-scale DBs (#1724).
+	// chunkedTxLastSeenBackfill runs the work in bounded chunks with a
+	// reader yield between batches so /api/healthz, packet reads, and
+	// ingest do not queue behind it. Math for ~71K transmissions:
+	// 71K / 5000 ≈ 15 batches × (~50ms exec + 100ms yield) ≈ ~2.5s wall
+	// with readers slotted in at most every 150ms. PR #1725 docs claimed
+	// "~300 batches × 150ms ≈ 45s" — that confused observations (1.5M)
+	// with transmissions (71K); the real number is ~20x smaller.
+	// Subsequent observation inserts maintain the column inline (see
+	// InsertTransmission + stmtBumpTxLastSeen below).
+	// PREFLIGHT: async=true reason="chunked backfill UPDATE; bounded reader yield every batch; safe at any scale"
 	if err := s.RunAsyncMigration(context.Background(), "tx_last_seen_backfill_v1",
 		func(ctx context.Context, d *sql.DB) error {
-			log.Println("[migration/async] Backfilling transmissions.last_seen from MAX(observations.timestamp)...")
-			res, err := d.ExecContext(ctx, `
-				UPDATE transmissions
-				SET last_seen = COALESCE((
-					SELECT MAX(timestamp) FROM observations WHERE transmission_id = transmissions.id
-				), last_seen)
-				WHERE last_seen = 0
-			`)
+			log.Println("[migration/async] Backfilling transmissions.last_seen (chunked, reader-yielding)...")
+			processed, total, err := chunkedTxLastSeenBackfill(ctx, d, 5000, 100*time.Millisecond, nil)
 			if err != nil {
 				return err
 			}
-			n, _ := res.RowsAffected()
-			log.Printf("[migration/async] transmissions.last_seen backfill complete: %d rows updated", n)
+			log.Printf("[migration/async] transmissions.last_seen backfill complete: %d / %d rows", processed, total)
 			return nil
 		}); err != nil {
 		log.Printf("[migration/async] scheduling tx_last_seen_backfill_v1 failed: %v", err)
