@@ -918,8 +918,19 @@ func (s *Server) handlePerf(w http.ResponseWriter, r *http.Request) {
 			if s.db == nil {
 				return []AsyncMigrationInfo{}
 			}
+			// #1735 finding #1 (Group A): on error, log + return
+			// empty BUT also set a header so operators have a
+			// signal. We can't 500 here because the rest of the
+			// /api/perf payload is still useful; the dedicated
+			// /api/perf/async-migrations endpoint DOES 500 (see
+			// handlePerfAsyncMigrations).
 			infos, err := readAsyncMigrations(s.db.conn)
-			if err != nil || infos == nil {
+			if err != nil {
+				log.Printf("[perf] readAsyncMigrations failed: %v", err)
+				w.Header().Set("X-Async-Migrations-Error", err.Error())
+				return []AsyncMigrationInfo{}
+			}
+			if infos == nil {
 				return []AsyncMigrationInfo{}
 			}
 			return infos

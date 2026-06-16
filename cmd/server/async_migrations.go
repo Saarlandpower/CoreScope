@@ -16,12 +16,20 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 const asyncMigrationsTTL = 5 * time.Second
+
+// asyncMigrationsSF collapses concurrent /api/healthz + /api/perf calls
+// during a cache miss into a single DB read. Errors are not cached and
+// each caller gets the same error on a shared in-flight read.
+var asyncMigrationsSF singleflight.Group
 
 // AsyncMigrationInfo is the JSON shape returned via /api/perf and embedded
 // in /api/healthz.
@@ -39,12 +47,14 @@ type AsyncMigrationInfo struct {
 	ErrorMessage   string  `json:"errorMessage,omitempty"`
 }
 
-// asyncMigrationsCache caches the latest readAsyncMigrationsRaw result.
+// asyncMigrationsCache caches the latest successful readAsyncMigrationsRaw
+// result. Errors are NOT cached (#1735 finding #4 / Group C): every error
+// path retries on the next call so transient I/O failures don't get
+// pinned for asyncMigrationsTTL.
 var (
 	asyncMigrationsCacheMu sync.Mutex
 	asyncMigrationsCacheAt time.Time
 	asyncMigrationsCached  []AsyncMigrationInfo
-	asyncMigrationsCacheErr error
 )
 
 // asyncMigrationsNow is overridable for tests.
@@ -53,18 +63,41 @@ var asyncMigrationsNow = time.Now
 // readAsyncMigrations returns the current set of async migration info,
 // using a short TTL cache to avoid hammering the writer-held DB on hot
 // paths like /api/healthz.
+//
+// Concurrency contract (#1735 finding #3 / Group C):
+//   - Cache mutex is NEVER held across db.Query — only across the
+//     check/populate steps. The actual I/O runs through singleflight so
+//     concurrent callers during a cache miss share one DB read.
+//   - Errors are NOT cached (#1735 finding #4): a transient query failure
+//     does not pin healthz/perf at "empty" for asyncMigrationsTTL.
 func readAsyncMigrations(db *sql.DB) ([]AsyncMigrationInfo, error) {
+	// Step 1: cache hit under lock, release before any I/O.
 	asyncMigrationsCacheMu.Lock()
-	defer asyncMigrationsCacheMu.Unlock()
 	if !asyncMigrationsCacheAt.IsZero() &&
 		asyncMigrationsNow().Sub(asyncMigrationsCacheAt) < asyncMigrationsTTL {
-		return asyncMigrationsCached, asyncMigrationsCacheErr
+		cached := asyncMigrationsCached
+		asyncMigrationsCacheMu.Unlock()
+		return cached, nil
 	}
-	out, err := readAsyncMigrationsRaw(db)
+	asyncMigrationsCacheMu.Unlock()
+
+	// Step 2: do the I/O through singleflight so a thundering herd of
+	// /api/healthz polls collapses into one query.
+	v, err, _ := asyncMigrationsSF.Do("read", func() (interface{}, error) {
+		return readAsyncMigrationsRaw(db)
+	})
+	if err != nil {
+		// Do NOT cache the error — let the next caller retry.
+		return nil, err
+	}
+	out, _ := v.([]AsyncMigrationInfo)
+
+	// Step 3: re-acquire to populate cache.
+	asyncMigrationsCacheMu.Lock()
 	asyncMigrationsCached = out
-	asyncMigrationsCacheErr = err
 	asyncMigrationsCacheAt = asyncMigrationsNow()
-	return out, err
+	asyncMigrationsCacheMu.Unlock()
+	return out, nil
 }
 
 // readAsyncMigrationsRaw bypasses the cache.
@@ -105,8 +138,21 @@ func readAsyncMigrationsRaw(db *sql.DB) ([]AsyncMigrationInfo, error) {
 		}
 		info.Status = mapAsyncStatus(rawStatus)
 
-		startTs, _ := parseAsyncTime(info.StartedAt)
-		endTs, _ := parseAsyncTime(info.EndedAt)
+		startTs, startErr := parseAsyncTime(info.StartedAt)
+		endTs, endErr := parseAsyncTime(info.EndedAt)
+		// #1735 finding #6: do not silently discard parse errors. Build
+		// the parseMsg now; append it AFTER the status-driven
+		// ErrorMessage wipe below so it survives non-failed statuses too.
+		parseMsg := ""
+		if startErr != nil {
+			parseMsg = "startedAt: " + startErr.Error()
+		}
+		if endErr != nil {
+			if parseMsg != "" {
+				parseMsg += "; "
+			}
+			parseMsg += "endedAt: " + endErr.Error()
+		}
 		switch info.Status {
 		case "running":
 			if !startTs.IsZero() {
@@ -126,6 +172,14 @@ func readAsyncMigrationsRaw(db *sql.DB) ([]AsyncMigrationInfo, error) {
 		}
 		if info.Status != "failed" {
 			info.ErrorMessage = ""
+		}
+		// Append parse errors after the wipe so they always surface.
+		if parseMsg != "" {
+			if info.ErrorMessage == "" {
+				info.ErrorMessage = parseMsg
+			} else {
+				info.ErrorMessage = info.ErrorMessage + " | " + parseMsg
+			}
 		}
 		out = append(out, info)
 	}
@@ -189,20 +243,33 @@ func invalidateAsyncMigrationsCache() {
 	asyncMigrationsCacheMu.Lock()
 	asyncMigrationsCacheAt = time.Time{}
 	asyncMigrationsCached = nil
-	asyncMigrationsCacheErr = nil
 	asyncMigrationsCacheMu.Unlock()
 }
 
 // handlePerfAsyncMigrations exposes the read-only async-migration state at
 // /api/perf/async-migrations so dashboards / curl can poll progress
 // without fetching the full /api/perf payload.
+//
+// #1735 finding #1 (Group A): on readAsyncMigrations error, return
+// HTTP 500 with the error body instead of silently returning an empty
+// list. An empty list is a meaningful operator signal (no migrations
+// pending); a query failure must be visible, not disguised.
 func (s *Server) handlePerfAsyncMigrations(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	out := []AsyncMigrationInfo{}
-	if s.db != nil {
-		if infos, err := readAsyncMigrations(s.db.conn); err == nil && infos != nil {
-			out = infos
-		}
+	if s.db == nil {
+		writeJSON(w, []AsyncMigrationInfo{})
+		return
 	}
-	writeJSON(w, out)
+	infos, err := readAsyncMigrations(s.db.conn)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "readAsyncMigrations: " + err.Error(),
+		})
+		return
+	}
+	if infos == nil {
+		infos = []AsyncMigrationInfo{}
+	}
+	writeJSON(w, infos)
 }

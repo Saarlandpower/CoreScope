@@ -99,7 +99,19 @@ func recordAsyncMigrationProgressEx(db *sql.DB, name string, processed, total in
 		})
 		return err
 	}
-	_ = res
+	// #1735 finding #7: a UPDATE that affects 0 rows means the migration
+	// bookkeeping row is missing — every caller of this function expects
+	// RunAsyncMigration to have inserted the row already. Silently
+	// returning nil would let backfills "succeed" while their progress
+	// surface stays at 0/0 forever. Treat as a hard error so the caller
+	// can mark the migration failed.
+	n, raErr := res.RowsAffected()
+	if raErr != nil {
+		return fmt.Errorf("recordAsyncMigrationProgress(%s) RowsAffected: %w", name, raErr)
+	}
+	if n == 0 {
+		return fmt.Errorf("recordAsyncMigrationProgress(%s): no row updated (bookkeeping row missing)", name)
+	}
 	return nil
 }
 

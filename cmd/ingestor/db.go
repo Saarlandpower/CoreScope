@@ -176,18 +176,39 @@ func OpenStoreWithInterval(dbPath string, sampleIntervalSec int) (*Store, error)
 	if err := s.RunAsyncMigration(context.Background(), "tx_last_seen_backfill_v1",
 		func(ctx context.Context, d *sql.DB) error {
 			log.Println("[migration/async] Backfilling transmissions.last_seen (chunked, reader-yielding)...")
+			// #1735 finding #7 (Group A): track progress-write failures
+			// so a persistent bookkeeping error (missing row, schema
+			// drift) marks the migration failed instead of silently
+			// running to completion with no visible progress.
+			var progressErrs int
 			processed, total, err := chunkedTxLastSeenBackfill(ctx, d, 5000, 100*time.Millisecond,
 				func(p, t int64) {
-					_ = recordAsyncMigrationProgress(d, "tx_last_seen_backfill_v1", p, t)
+					if perr := recordAsyncMigrationProgress(d, "tx_last_seen_backfill_v1", p, t); perr != nil {
+						progressErrs++
+						if progressErrs == 1 {
+							log.Printf("[migration/async] progress write failed (will fail migration if persistent): %v", perr)
+						}
+					}
 				})
 			if err != nil {
 				// Force-write whatever counts we have so the surfaced
 				// progress reflects the failure point, not stale data.
-				_ = recordAsyncMigrationProgressTerminal(d, "tx_last_seen_backfill_v1", processed, total)
+				if perr := recordAsyncMigrationProgressTerminal(d, "tx_last_seen_backfill_v1", processed, total); perr != nil {
+					log.Printf("[migration/async] terminal progress write failed: %v", perr)
+				}
 				return err
 			}
 			// Force-write the terminal stable counts past the rate limiter.
-			_ = recordAsyncMigrationProgressTerminal(d, "tx_last_seen_backfill_v1", processed, total)
+			if perr := recordAsyncMigrationProgressTerminal(d, "tx_last_seen_backfill_v1", processed, total); perr != nil {
+				// Terminal write failure is itself a failed migration:
+				// the surface counts are now untrustworthy.
+				return fmt.Errorf("terminal progress write: %w", perr)
+			}
+			if progressErrs > 0 {
+				// In-loop progress writes failed but terminal succeeded —
+				// log but do not fail. The terminal write is authoritative.
+				log.Printf("[migration/async] %d in-loop progress writes failed (terminal write OK)", progressErrs)
+			}
 			log.Printf("[migration/async] transmissions.last_seen backfill complete: %d / %d rows", processed, total)
 			return nil
 		}); err != nil {
