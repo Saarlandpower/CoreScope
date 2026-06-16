@@ -70,6 +70,17 @@ func randHex(i int) string {
 // reader gets through in bounded latency while the backfill is running. A
 // fake single-transaction implementation would NOT satisfy this — the
 // reader would queue behind sqlite_busy_timeout for the full duration.
+//
+// #1735 finding #13 (kent-beck BLOCKER): the original threshold (12K rows,
+// 500ms reader-latency bound) is too loose — a single-tx fake whose total
+// wall time is <500ms could pass. We tighten by (a) sampling baseline
+// reader latency BEFORE the backfill starts, then (b) asserting that the
+// during-backfill reader latency is < 5x baseline AND < 80ms absolute.
+// A single-tx loop that holds the writer the entire wall time would push
+// the during-latency ratio into the 50-100x range (readers queue behind
+// busy_timeout for the full UPDATE duration), which would fail this
+// assertion deterministically. Comment intent: this assertion bites a
+// fake that drops the per-batch yield, even if total wall time is short.
 func TestChunkedBackfill_YieldsToReaderBetweenBatches(t *testing.T) {
 	s := newTestStore(t)
 	seedTransmissions(t, s, 12_000)
@@ -77,40 +88,64 @@ func TestChunkedBackfill_YieldsToReaderBetweenBatches(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Background backfill (modest yield delay so the test is bounded).
+	// (a) Baseline: sample reader latency with NO concurrent backfill.
+	// Average of a few probes; absorbs cold-cache effects.
+	var baselineSum time.Duration
+	const baselineProbes = 5
+	for i := 0; i < baselineProbes; i++ {
+		t0 := time.Now()
+		var c int64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM transmissions`).Scan(&c); err != nil {
+			t.Fatalf("baseline scan: %v", err)
+		}
+		baselineSum += time.Since(t0)
+	}
+	baseline := baselineSum / baselineProbes
+	if baseline == 0 {
+		baseline = time.Microsecond // floor to avoid div-by-zero
+	}
+
+	// (b) Backfill in background with modest yield.
 	backfillDone := make(chan error, 1)
 	go func() {
 		_, _, err := chunkedTxLastSeenBackfill(ctx, s.db, 2000, 50*time.Millisecond, nil)
 		backfillDone <- err
 	}()
 
-	// Give the backfill a moment to actually start its first chunk.
+	// Give the backfill a moment to start its first chunk.
 	time.Sleep(20 * time.Millisecond)
 
-	// Concurrent reader: must succeed in bounded time. A single-tx
-	// implementation that holds the writer for the full duration would
-	// either time out or take seconds to acquire the lock.
-	readDeadline := time.Now().Add(2 * time.Second)
-	var readLatency time.Duration
-	readStart := time.Now()
-	var rowCount int64
+	// Sample best reader latency during backfill. We take the BEST of
+	// several attempts (not worst) because a single transient queue
+	// behind one Exec is unavoidable; what matters is that SOME probe
+	// slots in between batches. A single-tx implementation would
+	// produce best-during-latency ≈ total wall time / probes.
+	readDeadline := time.Now().Add(3 * time.Second)
+	bestDuring := time.Hour
 	for time.Now().Before(readDeadline) {
-		queryStart := time.Now()
-		row := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM transmissions`)
+		t0 := time.Now()
 		var c int64
-		if err := row.Scan(&c); err != nil {
-			t.Fatalf("reader scan: %v", err)
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM transmissions`).Scan(&c); err != nil {
+			t.Fatalf("during scan: %v", err)
 		}
-		readLatency = time.Since(queryStart)
-		rowCount = c
-		if readLatency < 500*time.Millisecond {
-			// Got a fast read while backfill running → good signal.
-			break
+		if d := time.Since(t0); d < bestDuring {
+			bestDuring = d
 		}
+		// Short pause between probes so we sample multiple yield windows.
+		time.Sleep(10 * time.Millisecond)
 	}
-	t.Logf("reader latency: %v, count=%d, total wall=%v", readLatency, rowCount, time.Since(readStart))
-	if readLatency > 500*time.Millisecond {
-		t.Errorf("reader latency=%v exceeded bound — backfill is not yielding the writer", readLatency)
+	t.Logf("baseline=%v bestDuring=%v ratio=%.2fx", baseline, bestDuring, float64(bestDuring)/float64(baseline))
+
+	if bestDuring > 80*time.Millisecond {
+		t.Errorf("best reader latency during backfill=%v exceeds 80ms — yield is not effective", bestDuring)
+	}
+	if float64(bestDuring) > 5.0*float64(baseline) && bestDuring > 5*time.Millisecond {
+		// Floor at 5ms to avoid flaky failures when baseline is <1ms
+		// (the 5x ratio is meaningless at sub-ms scale).
+		t.Errorf("reader latency ratio (during/baseline)=%v/%v=%.1fx exceeds 5x — backfill likely not yielding the writer",
+			bestDuring, baseline, float64(bestDuring)/float64(baseline))
 	}
 
 	// Backfill should complete.
@@ -271,6 +306,15 @@ func TestChunkedBackfill_ParamValidation(t *testing.T) {
 // TestChunkedBackfill_OrphanTxTerminates: transmission row with no matching
 // observation must NOT trap the loop. Using EXISTS in the WHERE clause skips
 // the row; the chunk returns n=0 after eligible rows are exhausted; loop ends.
+//
+// #1735 finding #12: the orphan insert and the seedTransmissions call run
+// in SEPARATE transactional contexts on purpose: the orphan is a single
+// INSERT with no observation row (so it cannot share seedTransmissions'
+// tx, which inserts observations alongside every tx), and keeping them
+// split makes the orphan-vs-normal distinction visible in the test body.
+// The chunkedTxLastSeenBackfill loop's behavior is committed-state-only
+// (no shared transaction with the seed), so the split has no effect on
+// what's being asserted.
 func TestChunkedBackfill_OrphanTxTerminates(t *testing.T) {
 	s := newTestStore(t)
 	s.WaitForAsyncMigrations()
