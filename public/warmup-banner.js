@@ -54,6 +54,29 @@
         ' / ' + fmtNum(total) + ' (' + pct + '%)');
     }
 
+    // Async migrations (#1724): per-migration progress + failed-state surface.
+    // Banner stays up while any migration is "running" — gated by isSteadyState
+    // checking async_migrations_running. Failed migrations are surfaced
+    // explicitly with their error message; we do NOT silently drop them.
+    var migrations = Array.isArray(h.async_migrations) ? h.async_migrations : [];
+    for (var mi = 0; mi < migrations.length; mi++) {
+      var m = migrations[mi] || {};
+      var mname = String(m.name || 'migration');
+      if (m.status === 'running') {
+        var mp = Number(m.rowsProcessed) || 0;
+        var mt = Number(m.rowsTotal) || 0;
+        var line = 'Migration ' + mname + ': ' + fmtNum(mp) + ' / ' + fmtNum(mt) + ' rows';
+        var eta = Number(m.etaSec);
+        if (isFinite(eta) && eta > 0) {
+          line += ' (ETA ' + Math.round(eta) + 's)';
+        }
+        msgs.push(line);
+      } else if (m.status === 'failed') {
+        var err = m.errorMessage ? String(m.errorMessage) : 'unknown error';
+        msgs.push('Migration ' + mname + ' FAILED: ' + err);
+      }
+    }
+
     var liveness = h.ingest_liveness || {};
     var srcs = Object.keys(liveness).sort();
     for (var i = 0; i < srcs.length; i++) {
@@ -76,7 +99,9 @@
   }
 
   /**
-   * Steady-state predicate: ready=true AND from_pubkey_backfill.done=true.
+   * Steady-state predicate: ready=true AND from_pubkey_backfill.done=true
+   * AND no async migration is currently running (#1724) AND no async migration
+   * is in a "failed" state (failures must remain visible until ack'd).
    * Once true, banner is dismissed and polling is torn down.
    */
   function isSteadyState(healthz) {
@@ -84,6 +109,11 @@
     if (healthz.ready !== true) return false;
     var bf = healthz.from_pubkey_backfill;
     if (bf && bf.done === false) return false;
+    if (healthz.async_migrations_running === true) return false;
+    var migs = Array.isArray(healthz.async_migrations) ? healthz.async_migrations : [];
+    for (var i = 0; i < migs.length; i++) {
+      if (migs[i] && migs[i].status === 'failed') return false;
+    }
     return true;
   }
 
