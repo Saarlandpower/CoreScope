@@ -8448,7 +8448,19 @@ func (s *PacketStore) computeNodeHashSizeInfo() map[string]*hashSizeNodeInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	info := make(map[string]*hashSizeNodeInfo)
+	// Collect (timestamp, hashSize) per pubkey so we can order adverts
+	// chronologically below. byPayloadType iteration is insertion order, which
+	// is not guaranteed to be chronological (out-of-order MQTT ingest, chunked
+	// cold-load), so we must sort by timestamp before reasoning about "latest"
+	// or "most recent" adverts. We parse FirstSeen rather than string-compare it
+	// so ordering is robust to timestamp-format differences (RFC3339 with or
+	// without fractional seconds); an unparseable/empty FirstSeen sorts oldest
+	// so it can never masquerade as the latest advert.
+	type hsEntry struct {
+		ts   time.Time
+		size int
+	}
+	entries := make(map[string][]hsEntry)
 
 	cutoff := time.Now().UTC().Add(-7 * 24 * time.Hour).Format("2006-01-02T15:04:05.000Z")
 
@@ -8504,26 +8516,34 @@ func (s *PacketStore) computeNodeHashSizeInfo() map[string]*hashSizeNodeInfo {
 			continue
 		}
 
-		ni := info[pk]
-		if ni == nil {
-			ni = &hashSizeNodeInfo{AllSizes: make(map[int]bool)}
-			info[pk] = ni
-		}
-		ni.AllSizes[hs] = true
-		ni.Seq = append(ni.Seq, hs)
+		// time.Parse(time.RFC3339, ...) accepts both the ingestor's no-fraction
+		// form ("...05Z") and a fractional form ("...05.000Z"). Zero time on
+		// parse failure → sorts oldest.
+		ts, _ := time.Parse(time.RFC3339, tx.FirstSeen)
+		entries[pk] = append(entries[pk], hsEntry{ts: ts, size: hs})
 	}
 
-	// Post-process: use latest advert hash size and compute flip-flop flag.
-	// The most recent advert reflects the node's current hash size
-	// configuration. The upstream firmware bug causing stale path bytes in
-	// flood adverts was fixed (meshcore-dev/MeshCore#2154).
-	for _, ni := range info {
+	info := make(map[string]*hashSizeNodeInfo)
+	for pk, es := range entries {
+		// Order adverts chronologically. Stable sort so that adverts with equal
+		// (or unparseable) timestamps keep insertion order.
+		sort.SliceStable(es, func(i, j int) bool { return es[i].ts.Before(es[j].ts) })
+
+		ni := &hashSizeNodeInfo{AllSizes: make(map[int]bool), Seq: make([]int, len(es))}
+		for i, e := range es {
+			ni.Seq[i] = e.size
+			ni.AllSizes[e.size] = true
+		}
+		info[pk] = ni
+
 		// Use the most recent advert's hash size (last in chronological order).
+		// The upstream firmware bug causing stale path bytes in flood adverts
+		// was fixed (meshcore-dev/MeshCore#2154).
 		ni.HashSize = ni.Seq[len(ni.Seq)-1]
 
-		// Flip-flop (inconsistent) flag: need >= 3 observations,
+		// Flip-flop (inconsistent) flag: need a minimum number of observations,
 		// >= 2 unique sizes, and >= 2 transitions in the sequence.
-		if len(ni.Seq) < 3 || len(ni.AllSizes) < 2 {
+		if len(ni.Seq) < hashSizeMinObservations || len(ni.AllSizes) < 2 {
 			continue
 		}
 		transitions := 0
@@ -8532,10 +8552,51 @@ func (s *PacketStore) computeNodeHashSizeInfo() map[string]*hashSizeNodeInfo {
 				transitions++
 			}
 		}
-		ni.Inconsistent = transitions >= 2
+		if transitions < 2 {
+			continue
+		}
+		// Recency decay (issue #1726): if the most recent adverts all agree on
+		// a single size, the node has settled on its current hash mode (e.g. an
+		// operator flipped path.hash.mode mid-flight, or a lone stale 1-byte
+		// advert sits earlier in the 7-day window). Don't keep reporting "varies"
+		// over older history once the node is consistent again. A node whose
+		// recent adverts still disagree remains flagged.
+		//
+		// Known limitation: a node that flaps slowly (long stable stretches
+		// between toggles) is not flagged during a stable stretch. This is
+		// intentional — "varies" describes the node's *current* state — and the
+		// full history stays visible via hash_sizes_seen / AllSizes.
+		if recentAdvertsAgree(ni.Seq, hashSizeRecentAgreeCount) {
+			continue
+		}
+		ni.Inconsistent = true
 	}
 
 	return info
+}
+
+// hashSizeMinObservations is the minimum number of non-zero-hop adverts in the
+// window before a node is eligible to be flagged as flip-flopping at all.
+const hashSizeMinObservations = 3
+
+// hashSizeRecentAgreeCount is how many of the most recent non-zero-hop adverts
+// must share a single hash size for a node to be considered "settled", clearing
+// its flip-flop ("varies") flag.
+const hashSizeRecentAgreeCount = 3
+
+// recentAdvertsAgree reports whether the last n entries of a chronologically
+// ordered hash-size sequence are all equal.
+func recentAdvertsAgree(seq []int, n int) bool {
+	if len(seq) < n {
+		return false
+	}
+	last := seq[len(seq)-1]
+	for i := len(seq) - n; i < len(seq)-1; i++ {
+		if seq[i] != last {
+			return false
+		}
+	}
+	return true
 }
 
 // EnrichNodeWithHashSize populates hash_size, hash_size_inconsistent, and
